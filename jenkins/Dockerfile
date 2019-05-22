@@ -4,6 +4,7 @@
 
 FROM jenkinsci/blueocean
 USER root
-RUN apk update
-RUN apk add nodejs npm python3
+RUN apk update && \
+    apk add ruby ruby-rdoc python3
 RUN pip3 install awscli --upgrade
+RUN gem install bundler
