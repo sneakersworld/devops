@@ -1,0 +1,20 @@
+# https://github.com/snowplow/snowplow/wiki/Setting-up-PostgreSQL
+# https://blog.bigbinary.com/2016/01/23/configure-postgresql-to-allow-remote-connection.html
+#
+
+# install postgresql
+sudo yum install postgresql postgresql-server postgresql-devel postgresql-contrib postgresql-docs
+
+# initialize database
+postgresql-setup initdb
+
+# edit pg_hba.conf file at /var/lib/pgsql/data/pg_hba.conf
+# edit postgresql.conf at /var/lib/pgsql/data/postgressql.conf
+
+# start server
+sudo service postgresql start
+
+# log into server and add password
+sudo su - postgres
+psql -U postgres
+# ALTER USER postgres WITH PASSWORD '$password';
