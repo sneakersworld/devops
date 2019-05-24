@@ -1,0 +1,197 @@
+#!/usr/bin/env ruby
+
+require "json"
+require "awesome_print"
+require "pry"
+
+$KEYPAIR_NAME="sneakersworld-api-kp"
+$CLUSTER_NAME="sneakersworld-api"
+$CLUSTER_CONFIG_NAME="sneakersworld-api-config"
+$LOAD_BALANCER_NAME="sneakersworld-api-lb"
+$LOAD_BALANCER_TARGET_GROUP="sneakersworld-api-lb-tg"
+$LOAD_BALANCER_SG_NAME="sneakersworld-api-lb-sg"
+$CONTAINER_NAME="sneakersworld-api"
+$CONTAINER_PORT="4567"
+
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ECS_CLI_reference.html
+def createECSCluster
+  puts `aws ec2 create-key-pair \
+    --key-name #{$KEYPAIR_NAME} \
+    --region #{$REGION} \
+    --query 'KeyMaterial' \
+    --output text > #{$KEYPAIR_NAME}.pem`
+
+  puts `ecs-cli configure \
+    --cluster #{$CLUSTER_NAME} \
+    --default-launch-type EC2 \
+    --config-name #{$CLUSTER_CONFIG_NAME} \
+    --region #{$REGION}`
+
+  # Sample output:
+  #   ...
+  #   VPC created: vpc-04143f62913185f79
+  #   Security Group created: sg-0077fd5b50463832d
+  #   Subnet created: subnet-082ccb55ceed618ff
+  #   Subnet created: subnet-0954149f374a637ef
+  #   Cluster creation succeeded.
+  puts "Creating cluster #{$CLUSTER_NAME}..."
+  output = `ecs-cli up \
+    --keypair #{$KEYPAIR_NAME} \
+    --cluster-config #{$CLUSTER_CONFIG_NAME} \
+    --capability-iam \
+    --size 2 \
+    --instance-type t2.micro \
+    --launch-type EC2 \
+    --region #{$REGION} \
+    --force`
+  puts output
+
+  output.split("\n").each do |line|
+    if line.include?("VPC created:")
+      vpc_array = line.split(":")
+      $VPC = vpc_array[1].strip
+    end
+    
+    if line.include?("Security Group created:") 
+      security_group_array = line.split(":")
+      $SECURITY_GROUP = security_group_array[1].strip
+    end
+
+    if line.include?("Subnet created:")
+      subnet_array = line.split(":")
+      if defined?($SUBNET1)
+        $SUBNET2 = subnet_array[1].strip
+      else
+        $SUBNET1 = subnet_array[1].strip
+      end
+    end
+  end
+  # binding.pry
+end
+
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/cmd-ecs-cli-compose-create.html
+def createTaskDefinition
+  puts "Creating task definition #{$CLUSTER_CONFIG_NAME}..."
+  puts `ecs-cli compose create \
+    --cluster-config #{$CLUSTER_CONFIG_NAME} \
+    --region #{$REGION}`
+end
+
+# https://docs.aws.amazon.com/cli/latest/reference/elbv2/create-load-balancer.html
+def createApplicationLoadBalancer
+  $LOAD_BALANCER_SG = JSON.parse(`aws ec2 create-security-group \
+    --group-name #{$LOAD_BALANCER_SG_NAME} \
+    --region #{$REGION} \
+    --vpc-id #{$VPC} \
+    --description "#{$CLUSTER_NAME} #{$REGION} Load Balancer Security Group"`)["GroupId"]
+
+  puts "Creating load balancer #{$LOAD_BALANCER_NAME}..."
+  output = JSON.parse(`aws elbv2 create-load-balancer \
+    --name #{$LOAD_BALANCER_NAME} \
+    --subnets #{$SUBNET1} #{$SUBNET2} \
+    --security-groups #{$LOAD_BALANCER_SG} \
+    --region #{$REGION}`)
+  pp output
+
+  $LOAD_BALANCER_ARN = output["LoadBalancers"][0]["LoadBalancerArn"]
+end
+
+# https://docs.aws.amazon.com/cli/latest/reference/elbv2/create-target-group.html
+def createTargetGroup
+  puts "Creating target group #{$LOAD_BALANCER_TARGET_GROUP}..."
+  output = JSON.parse(`aws elbv2 create-target-group \
+    --name #{$LOAD_BALANCER_TARGET_GROUP} \
+    --protocol HTTP \
+    --port 80 \
+    --vpc-id #{$VPC} \
+    --region #{$REGION}`)
+  pp output
+
+  $TARGET_GROUP_ARN = output["TargetGroups"][0]["TargetGroupArn"]
+end
+
+def createListener
+  puts `aws elbv2 create-listener \
+    --load-balancer-arn #{$LOAD_BALANCER_ARN} \
+    --protocol HTTP \
+    --port 80 \
+    --region #{$REGION} \
+    --default-actions "Type=forward,TargetGroupArn=#{$TARGET_GROUP_ARN}"`
+end
+
+# https://docs.aws.amazon.com/cli/latest/reference/elbv2/register-targets.html
+def registerTargets
+  # container instances take time to initialize so poll until up
+  loop do
+    puts "polling to see if container instances are up..."
+    sleep(10)
+    $CONTAINER_INSTANCES_ARN = JSON.parse(`aws ecs list-container-instances \
+      --cluster #{$CLUSTER_NAME} \
+      --region #{$REGION}`)["containerInstanceArns"].join(" ")
+    break if not $CONTAINER_INSTANCES_ARN.empty?
+  end
+
+  instance_ids = JSON.parse(`aws ecs describe-container-instances \
+    --cluster #{$CLUSTER_NAME} \
+    --container-instances #{$CONTAINER_INSTANCES_ARN} \
+    --region #{$REGION}`
+  )["containerInstances"].collect {|i| "Id=#{i['ec2InstanceId']}"}.join(" ")
+
+  puts `aws elbv2 register-targets \
+    --target-group-arn #{$TARGET_GROUP_ARN} \
+    --targets #{instance_ids} \
+    --region #{$REGION}`
+end
+
+# https://docs.aws.amazon.com/cli/latest/reference/ec2/update-security-group-rule-descriptions-ingress.html
+def authorizeSecurityGroupIngress
+  # Allow EC2 instances to receive traffic from load balancer
+  puts `aws ec2 authorize-security-group-ingress \
+    --group-id #{$SECURITY_GROUP} \
+    --protocol -1 \
+    --source-group #{$LOAD_BALANCER_SG} \
+    --region #{$REGION}`
+
+  # Open up http and https ports for load balancer
+  puts `aws ec2 authorize-security-group-ingress \
+    --group-id #{$LOAD_BALANCER_SG} \
+    --ip-permissions FromPort=80,IpProtocol=tcp,ToPort=80,IpRanges="[{CidrIp=0.0.0.0/0}]",Ipv6Ranges="[{CidrIpv6=::/0}]" \
+    --region #{$REGION}`
+
+  puts `aws ec2 authorize-security-group-ingress \
+    --group-id #{$LOAD_BALANCER_SG} \
+    --ip-permissions FromPort=443,IpProtocol=tcp,ToPort=443,IpRanges="[{CidrIp=0.0.0.0/0}]",Ipv6Ranges="[{CidrIpv6=::/0}]" \
+    --region #{$REGION}`
+end
+
+# https://docs.aws.amazon.com/AmazonECS/latest/developerguide/cmd-ecs-cli-compose-service-up.html
+# Note: need proper permissions on ecsServiceRole:
+#   https://docs.aws.amazon.com/AmazonECS/latest/developerguide/service_IAM_role.html?shortFooter=true
+def createECSService
+  puts "Creating ECS service #{$CLUSTER_NAME}..."
+  puts `ecs-cli compose \
+    --project-name #{$CONTAINER_NAME} \
+    service up \
+    --region #{$REGION} \
+    --cluster #{$CLUSTER_NAME} \
+    --launch-type EC2 \
+    --target-group-arn #{$TARGET_GROUP_ARN} \
+    --container-name #{$CONTAINER_NAME} \
+    --container-port #{$CONTAINER_PORT} \
+    --role ecsServiceRole`
+end
+
+if ARGV.length < 1
+  raise ArgumentError.new("\nRequires an argument [region]\nusage: provision [region]")
+else
+  $REGION=ARGV[0]
+
+  createECSCluster
+  createTaskDefinition
+  createApplicationLoadBalancer
+  createTargetGroup
+  createListener
+  registerTargets
+  authorizeSecurityGroupIngress
+  createECSService
+end

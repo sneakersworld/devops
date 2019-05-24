@@ -1,0 +1,7 @@
+
+version: '2'
+services:
+  sneakersworld-api:
+    image: paulyeo21/sneakersworld-api:1.0.1
+    ports:
+      - "4567"
